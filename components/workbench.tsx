@@ -5,6 +5,8 @@ import {
   BookOpen,
   Check,
   FlaskConical,
+  Gauge,
+  Lightbulb,
   Library,
   ListTree,
   LoaderCircle,
@@ -42,13 +44,20 @@ import {
 import {
   apiAnalyze,
   apiCompilePrompt,
+  apiContinuePolish,
   apiDemo,
+  apiGetGuides,
   apiGetWorkspace,
   apiImportBook,
+  apiListIdeas,
   apiRebuild,
   apiSaveBrief,
   apiSaveContinuity,
+  apiSaveIdea,
+  apiSavePreference,
+  apiSaveVolumePlan,
   apiSetMemory,
+  apiUpdateIdeaStatus,
   apiWriteReview,
 } from '@/lib/client-runtime';
 
@@ -63,8 +72,12 @@ type Snapshot = {
   findings: Row[];
   continuityItems: Row[];
   continuityEvents: Row[];
+  ideas: Row[];
+  chapterSummaries: Row[];
+  preferences: Row[];
+  volumes: Row[];
 };
-type View = 'studio' | 'library' | 'review';
+type View = 'studio' | 'library' | 'review' | 'v2';
 
 const emptySnapshot: Snapshot = {
   books: [],
@@ -76,12 +89,17 @@ const emptySnapshot: Snapshot = {
   findings: [],
   continuityItems: [],
   continuityEvents: [],
+  ideas: [],
+  chapterSummaries: [],
+  preferences: [],
+  volumes: [],
 };
 
 const navItems: Array<{ view: View; label: string; icon: typeof Library }> = [
   { view: 'studio', label: '创作台', icon: Sparkles },
   { view: 'library', label: '参考书', icon: Library },
   { view: 'review', label: '成稿', icon: ShieldCheck },
+  { view: 'v2', label: '头号写手', icon: Gauge },
 ];
 
 const rightsLabels: Record<string, string> = {
@@ -216,6 +234,7 @@ export function Workbench() {
   const runDemo = () =>
     runAction('demo', async () => {
       await apiDemo();
+      await refresh();
       setNotice({
         tone: 'ok',
         text: '原创测试文本已跑完“读、学、写、审”闭环。',
@@ -501,6 +520,16 @@ export function Workbench() {
                 onAddContinuityNote={createContinuity}
                 onRunDemo={runDemo}
                 onRebuild={rebuildFirstFive}
+                busy={busy}
+              />
+            )}
+            {view === 'v2' && (
+              <V2StudioView
+                snapshot={snapshot}
+                projectId={projectId}
+                projects={snapshot.projects}
+                onProject={selectProject}
+                onRefresh={refresh}
                 busy={busy}
               />
             )}
@@ -1861,5 +1890,433 @@ function ReviewView({
         </div>
       )}
     </>
+  );
+}
+
+// ----------------------------------------------------------------
+// 头号写手 v2：确定性增强面板（灵感库 / 节奏·文风 / 指南库 / 偏好记忆 / 多轮编辑）
+// ----------------------------------------------------------------
+
+function V2StudioView({
+  snapshot,
+  projectId,
+  projects,
+  onProject,
+  onRefresh,
+  busy,
+}: {
+  snapshot: Snapshot;
+  projectId?: string;
+  projects: Row[];
+  onProject: (id: string) => void;
+  onRefresh: () => Promise<void>;
+  busy: boolean;
+}) {
+  const [ideaTitle, setIdeaTitle] = useState('');
+  const [ideaContent, setIdeaContent] = useState('');
+  const [ideaKind, setIdeaKind] = useState('情节点');
+  const [ideaPriority, setIdeaPriority] = useState('3');
+  const [guideOpen, setGuideOpen] = useState<string | null>(null);
+  const [guides, setGuides] = useState<Array<{ id: string; title: string; summary: string; content: string[] }>>([]);
+  const [editingChapterId, setEditingChapterId] = useState('');
+  const [polishState, setPolishState] = useState<string>('');
+  const [prefText, setPrefText] = useState('');
+
+  const ideas = snapshot.ideas;
+  const summaries = snapshot.chapterSummaries;
+  const currentProject = projects.find(
+    (item) => String(item.id) === String(projectId),
+  ) ?? projects.find((item) =>
+    snapshot.chapters.some(
+      (chapter) => String(chapter.project_id) === String(item.id),
+    ),
+  );
+  const currentChapters = snapshot.chapters
+    .filter((item) => String(item.project_id) === String(currentProject?.id))
+    .sort((a, b) => Number(a.sequence) - Number(b.sequence));
+  const latestChapter = currentChapters[currentChapters.length - 1];
+  const latestSummary = summaries
+    .filter((item) => String(item.project_id) === String(currentProject?.id))
+    .sort((a, b) => Number(b.sequence) - Number(a.sequence))[0];
+
+  useEffect(() => {
+    apiGetGuides().then(setGuides).catch(() => {});
+  }, []);
+
+  async function addIdea() {
+    if (!ideaTitle.trim() || !ideaContent.trim()) return;
+    try {
+      await apiSaveIdea({
+        kind: ideaKind,
+        title: ideaTitle.trim(),
+        content: ideaContent.trim(),
+        priority: Number(ideaPriority) || 3,
+      });
+      setIdeaTitle('');
+      setIdeaContent('');
+      await onRefresh();
+    } catch (error) {
+      window.alert(error instanceof Error ? error.message : '灵感保存失败。');
+    }
+  }
+
+  async function setIdeaStatus(id: string, status: 'used' | 'discarded' | 'active') {
+    try {
+      await apiUpdateIdeaStatus(id, status);
+      await onRefresh();
+    } catch (error) {
+      window.alert(error instanceof Error ? error.message : '灵感状态更新失败。');
+    }
+  }
+
+  async function savePref() {
+    if (!prefText.trim()) return;
+    try {
+      await apiSavePreference('writingStyle', prefText.trim());
+      setPrefText('');
+      await onRefresh();
+    } catch (error) {
+      window.alert(error instanceof Error ? error.message : '偏好保存失败。');
+    }
+  }
+
+  async function runPolish() {
+    if (!editingChapterId) return;
+    setPolishState('running');
+    try {
+      const result = await apiContinuePolish(editingChapterId, { rounds: 3 });
+      setPolishState(
+        result.roundsRun === 0
+          ? '本轮无需再改（已通过全部规则）。'
+          : `完成 ${result.roundsRun} 轮改写，替换 ${result.changes.length} 处表达；复审 ${result.reviewPassed ? '通过' : '仍有提醒'}。`,
+      );
+      await onRefresh();
+    } catch (error) {
+      setPolishState(error instanceof Error ? error.message : '改写失败。');
+    }
+  }
+
+  async function planVolumesNow() {
+    if (!currentProject) return;
+    try {
+      const count = Math.max(1, currentChapters.length || 1);
+      await apiSaveVolumePlan(String(currentProject.id), count);
+      await onRefresh();
+    } catch (error) {
+      window.alert(error instanceof Error ? error.message : '卷规划失败。');
+    }
+  }
+
+  const latestFingerprint = latestChapter
+    ? (() => {
+        const raw = String(latestChapter.prompt_snapshot_json ?? '');
+        try {
+          const parsed = JSON.parse(raw);
+          return parsed.v2Mechanism ?? null;
+        } catch {
+          return null;
+        }
+      })()
+    : null;
+  const prefRow = snapshot.preferences.find((item) => String(item.key) === 'writingStyle');
+
+  return (
+    <div className="space-y-6">
+      <div className="flex items-center justify-between">
+        <div>
+          <h2 className="text-lg font-semibold">头号写手增强</h2>
+          <p className="mt-1 text-xs text-muted-foreground">
+            确定性规则与数据结构增强：灵感库、节奏曲线、文风指纹、指南库、偏好记忆与多轮改写。
+          </p>
+        </div>
+        <Button
+          size="sm"
+          variant="outline"
+          disabled={busy}
+          onClick={() => void onRefresh()}
+        >
+          <RefreshCw className="size-3.5" /> 刷新
+        </Button>
+      </div>
+
+      <div className="grid gap-4 lg:grid-cols-2">
+        {/* 灵感库 */}
+        <section className="rounded-lg border bg-card p-4">
+          <div className="flex items-center gap-2">
+            <Lightbulb className="size-4 text-amber-500" />
+            <h3 className="text-sm font-semibold">灵感库</h3>
+          </div>
+          <div className="mt-3 space-y-2">
+            <div className="grid grid-cols-2 gap-2">
+              <Input
+                placeholder="情节点/人物/场景…"
+                value={ideaTitle}
+                onChange={(event) => setIdeaTitle(event.target.value)}
+              />
+              <Input
+                placeholder="优先级 1-5"
+                value={ideaPriority}
+                onChange={(event) => setIdeaPriority(event.target.value)}
+              />
+            </div>
+            <Input
+              placeholder="类型（默认情节点）"
+              value={ideaKind}
+              onChange={(event) => setIdeaKind(event.target.value)}
+            />
+            <Textarea
+              className="min-h-20"
+              placeholder="灵感内容：写明谁、在什么场景、发生什么、造成什么后果…"
+              value={ideaContent}
+              onChange={(event) => setIdeaContent(event.target.value)}
+            />
+            <Button size="sm" disabled={busy} onClick={() => void addIdea()}>
+              <Plus className="size-3.5" /> 存入灵感库
+            </Button>
+          </div>
+          <div className="mt-4 space-y-2">
+            {ideas.length === 0 && (
+              <p className="text-xs text-muted-foreground">
+                还没有灵感。把灵光一现存进来，写作时自动可查。
+              </p>
+            )}
+            {ideas.slice(0, 8).map((idea) => (
+              <div
+                key={String(idea.id)}
+                className="rounded-md border border-border/70 bg-muted/30 p-3"
+              >
+                <div className="flex items-center justify-between gap-2">
+                  <p className="text-sm font-medium">
+                    {String(idea.title)}
+                    <span className="ml-2 rounded bg-muted px-1.5 py-0.5 text-[11px] text-muted-foreground">
+                      {String(idea.kind ?? '情节点')} · 优先{String(idea.priority)}
+                    </span>
+                  </p>
+                  <div className="flex shrink-0 gap-1">
+                    {String(idea.status) !== 'used' && (
+                      <button
+                        className="rounded px-1.5 py-0.5 text-[11px] text-muted-foreground hover:bg-muted"
+                        onClick={() => void setIdeaStatus(String(idea.id), 'used')}
+                        type="button"
+                      >
+                        已用
+                      </button>
+                    )}
+                    {String(idea.status) !== 'discarded' && (
+                      <button
+                        className="rounded px-1.5 py-0.5 text-[11px] text-muted-foreground hover:bg-muted"
+                        onClick={() => void setIdeaStatus(String(idea.id), 'discarded')}
+                        type="button"
+                      >
+                        弃用
+                      </button>
+                    )}
+                  </div>
+                </div>
+                <p className="mt-1 text-xs leading-relaxed text-muted-foreground">
+                  {String(idea.content)}
+                </p>
+              </div>
+            ))}
+          </div>
+        </section>
+
+        {/* 节奏曲线 + 文风指纹 */}
+        <section className="rounded-lg border bg-card p-4">
+          <div className="flex items-center gap-2">
+            <Gauge className="size-4 text-blue-500" />
+            <h3 className="text-sm font-semibold">节奏与文风</h3>
+          </div>
+          {!latestChapter ? (
+            <p className="mt-3 text-xs text-muted-foreground">
+              先选择作品并写出至少一章，这里会展示节奏曲线与文风指纹。
+            </p>
+          ) : latestFingerprint ? (
+            <div className="mt-3 space-y-3">
+              <div>
+                <p className="text-xs font-medium text-muted-foreground">
+                  最新章 · {String(latestChapter.title ?? '')}
+                </p>
+                <p className="mt-1 text-sm">
+                  情绪 {Number(latestFingerprint.pacing?.emotionScore ?? 0)} ／ 信息密度{' '}
+                  {Number(latestFingerprint.pacing?.infoDensity ?? 0)} ／ 对话占比{' '}
+                  {Math.round(Number(latestFingerprint.pacing?.dialogueRatio ?? 0) * 100)}% ／
+                  短句占比 {Math.round(Number(latestFingerprint.pacing?.shortSentenceRatio ?? 0) * 100)}%
+                </p>
+                <p className="mt-1 text-xs text-muted-foreground">
+                  平均句长 {Number(latestFingerprint.fingerprint?.avgSentenceLength ?? 0).toFixed(1)} 字 ／
+                  副词密度 {Number(latestFingerprint.fingerprint?.adverbDensity ?? 0).toFixed(2)}
+                </p>
+              </div>
+              {(latestFingerprint.pacing?.tensionHints?.length > 0 ? (
+                latestFingerprint.pacing.tensionHints
+              ) : (
+                ['节奏均衡，无张力提醒']
+              )).map((hint: string) => (
+                <p key={hint} className="text-xs text-muted-foreground">
+                  · {hint}
+                </p>
+              ))}
+              <div className="border-t border-border pt-2">
+                <p className="text-xs font-medium text-muted-foreground">
+                  12 类变更声明（本章）
+                </p>
+                {latestFingerprint.changes?.length > 0 ? (
+                  latestFingerprint.changes
+                    .slice(0, 6)
+                    .map((change: { kind: string; entity: string; from: string; to: string }) => (
+                      <p key={`${change.kind}-${change.entity}`} className="mt-1 text-xs">
+                        <span className="text-muted-foreground">
+                          [{String(change.kind)}] {String(change.entity)}：
+                        </span>
+                        {String(change.from)} → {String(change.to)}
+                      </p>
+                    ))
+                ) : (
+                  <p className="mt-1 text-xs text-muted-foreground">本章未声明可见变更。</p>
+                )}
+              </div>
+            </div>
+          ) : (
+            <p className="mt-3 text-xs text-muted-foreground">
+              本章快照还没有 v2 机制数据，重写本章后自动生成。
+            </p>
+          )}
+        </section>
+
+        {/* 多轮编辑 */}
+        <section className="rounded-lg border bg-card p-4">
+          <h3 className="text-sm font-semibold">多轮编辑</h3>
+          <p className="mt-1 text-xs text-muted-foreground">
+            对指定章节再跑至多 3 轮去AI味改写，替换阻断词、拆长句并复审。
+          </p>
+          <div className="mt-3 flex gap-2">
+            <NativeSelect
+              value={editingChapterId}
+              onChange={(event) => setEditingChapterId(event.target.value)}
+            >
+              <NativeSelectOption value="">选择章节…</NativeSelectOption>
+              {currentChapters.map((chapter) => (
+                <NativeSelectOption
+                  key={String(chapter.id)}
+                  value={String(chapter.id)}
+                >
+                  第 {String(chapter.sequence)} 章 · {String(chapter.title ?? '')}
+                </NativeSelectOption>
+              ))}
+            </NativeSelect>
+            <Button
+              size="sm"
+              disabled={busy || !editingChapterId}
+              onClick={() => void runPolish()}
+            >
+              <Workflow className="size-3.5" /> 改写
+            </Button>
+          </div>
+          {polishState && (
+            <p className="mt-2 text-xs text-muted-foreground">{polishState}</p>
+          )}
+          {latestSummary && (
+            <div className="mt-3 border-t border-border pt-2">
+              <p className="text-xs font-medium text-muted-foreground">
+                最近章节摘要（双记忆）
+              </p>
+              <p className="mt-1 text-xs leading-relaxed">{String(latestSummary.summary)}</p>
+            </div>
+          )}
+        </section>
+
+        {/* 偏好记忆 */}
+        <section className="rounded-lg border bg-card p-4">
+          <h3 className="text-sm font-semibold">偏好记忆</h3>
+          <p className="mt-1 text-xs text-muted-foreground">
+            记录你对行文风格的长期偏好（如：少用成语、对话带动作、每章留钩子）。
+          </p>
+          <Textarea
+            className="mt-3 min-h-16"
+            placeholder="例如：人物对话要带动作或停顿；每章结尾必须留一个具体悬念；避免成语连用…"
+            value={prefText}
+            onChange={(event) => setPrefText(event.target.value)}
+          />
+          <div className="mt-2 flex items-center gap-2">
+            <Button size="sm" disabled={busy} onClick={() => void savePref()}>
+              <Check className="size-3.5" /> 保存偏好
+            </Button>
+            {prefRow && (
+              <span className="text-[11px] text-muted-foreground">
+                已保存：{String(parseJson(prefRow.value_json, ''))}
+              </span>
+            )}
+          </div>
+          <div className="mt-4 border-t border-border pt-2">
+            <p className="text-xs font-medium text-muted-foreground">卷规划</p>
+            <p className="mt-1 text-xs text-muted-foreground">
+              按当前章节数生成卷→章四段规划（启幕/推进/转折/收束）。
+            </p>
+            <Button
+              className="mt-2"
+              size="sm"
+              variant="outline"
+              disabled={busy || !currentProject}
+              onClick={() => void planVolumesNow()}
+            >
+              <ListTree className="size-3.5" /> 生成卷规划
+            </Button>
+            {snapshot.volumes.length > 0 && (
+              <div className="mt-2 space-y-1">
+                {snapshot.volumes
+                  .filter((volume) => String(volume.project_id) === String(currentProject?.id))
+                  .map((volume) => (
+                    <p key={String(volume.id)} className="text-xs">
+                      <span className="font-medium">
+                        第 {String(volume.volume_no)} 卷 · {String(volume.title)}
+                      </span>
+                      <span className="text-muted-foreground">
+                        {' '}
+                        （{String(volume.start_sequence)}–{String(volume.end_sequence)} 章 ·{' '}
+                        {String(volume.strategy)}）
+                      </span>
+                    </p>
+                  ))}
+              </div>
+            )}
+          </div>
+        </section>
+
+        {/* 指南库 */}
+        <section className="rounded-lg border bg-card p-4 lg:col-span-2">
+          <div className="flex items-center gap-2">
+            <BookOpen className="size-4 text-emerald-500" />
+            <h3 className="text-sm font-semibold">写作指南库</h3>
+          </div>
+          <div className="mt-3 grid gap-3 md:grid-cols-2">
+            {guides.map((guide) => (
+              <div key={guide.id} className="rounded-md border border-border/70 p-3">
+                <button
+                  className="flex w-full items-center justify-between text-left"
+                  onClick={() => setGuideOpen(guideOpen === guide.id ? null : guide.id)}
+                  type="button"
+                >
+                  <span className="text-sm font-medium">{guide.title}</span>
+                  <span className="text-xs text-muted-foreground">
+                    {guideOpen === guide.id ? '收起' : '展开'}
+                  </span>
+                </button>
+                <p className="mt-1 text-xs text-muted-foreground">{guide.summary}</p>
+                {guideOpen === guide.id && (
+                  <ul className="mt-2 space-y-1 border-t border-border pt-2">
+                    {(guide.content ?? []).map((line) => (
+                      <li key={line} className="text-xs leading-relaxed">
+                        · {line}
+                      </li>
+                    ))}
+                  </ul>
+                )}
+              </div>
+            ))}
+          </div>
+        </section>
+      </div>
+    </div>
   );
 }

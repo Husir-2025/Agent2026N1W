@@ -73,6 +73,7 @@ void test('persists a project-specific continuity mechanism and compiles it into
   database.exec('PRAGMA foreign_keys = ON');
   applyMigration(database, '0000_modern_mockingbird.sql');
   applyMigration(database, '0001_steady_arachne.sql');
+  applyMigration(database, '0002_v2_enhancements.sql');
   const db = new TestD1(database) as unknown as D1Database;
 
   const saved = await saveWritingBrief(db, defaultWritingBrief);

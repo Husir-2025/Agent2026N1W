@@ -14,6 +14,13 @@ export default function RootLayout({
 }>) {
   return (
     <html lang="zh-CN">
+      <head>
+        <link
+          rel="icon"
+          href="/Agent2026N1W/favicon.svg"
+          type="image/svg+xml"
+        />
+      </head>
       <body>{children}</body>
     </html>
   );

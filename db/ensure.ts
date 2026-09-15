@@ -61,6 +61,46 @@ const statements = [
     id TEXT PRIMARY KEY, memory_item_id TEXT NOT NULL REFERENCES memory_items(id) ON DELETE CASCADE,
     action TEXT NOT NULL, note TEXT, created_at INTEGER NOT NULL
   )`,
+  // ---- 头号写手 v2：灵感库（写作素材库） ----
+  `CREATE TABLE IF NOT EXISTS ideas (
+    id TEXT PRIMARY KEY,
+    kind TEXT NOT NULL DEFAULT '情节点',
+    title TEXT NOT NULL,
+    content TEXT NOT NULL,
+    priority INTEGER NOT NULL DEFAULT 3,
+    person_tag TEXT,
+    tags_json TEXT NOT NULL DEFAULT '[]',
+    placement TEXT,
+    status TEXT NOT NULL DEFAULT 'active',
+    used_in_sequence INTEGER,
+    created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL
+  )`,
+  // ---- 头号写手 v2：章节摘要（双记忆：近期章节详细摘要） ----
+  `CREATE TABLE IF NOT EXISTS chapter_summaries (
+    id TEXT PRIMARY KEY,
+    project_id TEXT NOT NULL REFERENCES story_projects(id) ON DELETE CASCADE,
+    chapter_id TEXT NOT NULL REFERENCES chapters(id) ON DELETE CASCADE,
+    sequence INTEGER NOT NULL, title TEXT NOT NULL,
+    summary TEXT NOT NULL, key_facts_json TEXT NOT NULL DEFAULT '[]',
+    created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL,
+    UNIQUE(chapter_id)
+  )`,
+  // ---- 头号写手 v2：用户偏好记忆 ----
+  `CREATE TABLE IF NOT EXISTS user_preferences (
+    key TEXT PRIMARY KEY,
+    value_json TEXT NOT NULL,
+    updated_at INTEGER NOT NULL
+  )`,
+  // ---- 头号写手 v2：卷→章分层 ----
+  `CREATE TABLE IF NOT EXISTS volumes (
+    id TEXT PRIMARY KEY,
+    project_id TEXT NOT NULL REFERENCES story_projects(id) ON DELETE CASCADE,
+    volume_no INTEGER NOT NULL, title TEXT NOT NULL,
+    strategy TEXT NOT NULL, pacing TEXT,
+    start_sequence INTEGER NOT NULL, end_sequence INTEGER NOT NULL,
+    climax_sequence INTEGER, chapter_count INTEGER NOT NULL,
+    created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL
+  )`,
   'CREATE INDEX IF NOT EXISTS idx_books_created_at ON books(created_at)',
   'CREATE INDEX IF NOT EXISTS idx_books_sha256 ON books(sha256)',
   'CREATE INDEX IF NOT EXISTS idx_analysis_runs_book_created ON analysis_runs(book_id, created_at)',
@@ -74,6 +114,9 @@ const statements = [
   'CREATE INDEX IF NOT EXISTS idx_continuity_events_chapter ON continuity_events(chapter_id)',
   'CREATE INDEX IF NOT EXISTS idx_review_chapter_status ON review_findings(chapter_id, status)',
   'CREATE INDEX IF NOT EXISTS idx_memory_events_item_created ON memory_events(memory_item_id, created_at)',
+  'CREATE INDEX IF NOT EXISTS idx_ideas_status_priority ON ideas(status, priority)',
+  'CREATE INDEX IF NOT EXISTS idx_chapter_summaries_project_sequence ON chapter_summaries(project_id, sequence)',
+  'CREATE INDEX IF NOT EXISTS idx_volumes_project_no ON volumes(project_id, volume_no)',
 ];
 
 let initialized = false;

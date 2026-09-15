@@ -1,3 +1,12 @@
+// 头号写手 v2：确定性增强模块（去AI味词表/节奏曲线/文风指纹/变更提取/指南库）
+import {
+  auditAiTaste,
+  analyzePacing,
+  deAiPolish,
+  styleFingerprint,
+  WRITING_GUIDES,
+} from './writer-v2.ts';
+
 export type ChapterMapItem = {
   label: string;
   startOffset: number;
@@ -1155,7 +1164,12 @@ export function polishDraft(
     appliedChanges.push('用习惯动作呈现人物压力');
   }
   polished = paragraphs.join('\n\n');
-  polished = fitChapterLength(polished, brief);
+  // 头号写手 v2：三遍去AI味（阻断词替换 → 长句拆解 → 查漏）
+  const deAi = deAiPolish(polished);
+  if (deAi.changes.length > 0) {
+    appliedChanges.push(...deAi.changes);
+  }
+  polished = fitChapterLength(deAi.output, brief);
 
   const memoryTitles = [
     ...(context?.weaknesses ?? []),
@@ -2324,5 +2338,63 @@ export function reviewDraft(
       ? '继续让每次推进都暴露一点人物代价，避免只靠旁白解释动机。'
       : '让人物为了目标做出一个会失去东西的选择，再用动作和后果呈现性格。',
   });
+  // ---- 头号写手 v2：去AI味阻断/提醒分层 + 节奏曲线 ----
+  const aiAudit = auditAiTaste(content);
+  if (aiAudit.blockedCount > 0) {
+    findings.push({
+      reviewType: 'expert',
+      dimension: 'AI味阻断词',
+      severity: aiAudit.blockedCount >= 3 ? 'error' : 'warning',
+      message: `命中 ${aiAudit.blockedCount} 处禁用表达：${aiAudit.blockedHits
+        .slice(0, 4)
+        .map((hit) => hit.pattern)
+        .join('；')}${aiAudit.blockedCount > 4 ? '…' : ''}。`,
+      suggestion: '按“动作/物件/对话”替换成具体描写，阻断词表可一键改写。',
+      memoryCandidate: {
+        kind: 'weakness',
+        title: '禁用表达自动替换',
+        rule: '命中禁用词表时优先替换为动作、物件或带立场的对话。',
+      },
+    });
+  } else {
+    findings.push({
+      reviewType: 'expert',
+      dimension: 'AI味阻断词',
+      severity: 'info',
+      message: '未命中禁用表达词表。',
+      suggestion: '继续用提醒级规则复查疑似 AI 句式。',
+    });
+  }
+  if (aiAudit.suspiciousCount > 0) {
+    findings.push({
+      reviewType: 'expert',
+      dimension: 'AI味提醒词',
+      severity: 'warning',
+      message: `发现 ${aiAudit.suspiciousCount} 处疑似 AI 句式（${aiAudit.suspiciousHits
+        .slice(0, 3)
+        .map((hit) => hit.pattern)
+        .join('、')}${aiAudit.suspiciousCount > 3 ? '…' : ''}），不强制替换但建议人工复核。`,
+      suggestion: '逐处判断是否换成更具体的感官细节或人物动作。',
+    });
+  }
+  const pacing = analyzePacing(content);
+  const pacingRisks = pacing.tensionHints;
+  if (pacingRisks.length > 0 && pacing.paragraphCount >= 6) {
+    findings.push({
+      reviewType: 'expert',
+      dimension: '节奏曲线',
+      severity: 'warning',
+      message: `节奏检测：${pacingRisks.join('；')}（情绪 ${pacing.emotionScore}，信息密度 ${pacing.infoDensity}，对话占比 ${Math.round(pacing.dialogueRatio * 100)}%）。`,
+      suggestion: '按提示调整对应段落：短句区补细节、对话区加动作、负面情绪区留转机。',
+    });
+  } else {
+    findings.push({
+      reviewType: 'expert',
+      dimension: '节奏曲线',
+      severity: 'info',
+      message: `节奏检测：情绪 ${pacing.emotionScore}、信息密度 ${pacing.infoDensity}、对话占比 ${Math.round(pacing.dialogueRatio * 100)}%、短句占比 ${Math.round(pacing.shortSentenceRatio * 100)}%。`,
+      suggestion: '节奏均衡，可在信息密度高的段落主动放慢。',
+    });
+  }
   return findings;
 }

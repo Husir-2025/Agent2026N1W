@@ -18,6 +18,17 @@ import {
   type TechniqueCandidate,
 } from './pipeline.ts';
 import { segmentBook } from './pipeline.ts';
+// 头号写手 v2 增强模块
+import {
+  analyzePacing,
+  auditAiTaste,
+  extractChapterChanges,
+  HOOK_TYPES,
+  planVolumes,
+  styleFingerprint,
+  summarizeChapter,
+  type ChapterChange,
+} from './writer-v2.ts';
 
 export type BookInput = {
   title: string;
@@ -1052,6 +1063,19 @@ export async function runWritingLoop(
     continuityAudit,
     sequence,
   );
+  // ---- 头号写手 v2：12类变更声明 + 节奏曲线 + 文风指纹 + AI味审计 ----
+  const v2Changes = extractChapterChanges(
+    polished,
+    continuity.map((item) => ({ title: item.title, currentState: item.currentState })),
+    sequence,
+  );
+  const v2Mechanism = {
+    changes: v2Changes,
+    pacing: analyzePacing(polished),
+    fingerprint: styleFingerprint(polished),
+    aiTaste: auditAiTaste(polished),
+    hooks: HOOK_TYPES.slice(0, 3),
+  };
   statements.push(
     db
       .prepare(`INSERT INTO chapters
@@ -1100,6 +1124,7 @@ export async function runWritingLoop(
               '久未演变不一定错误，但必须检查维持不变的代价',
             ],
           },
+          v2Mechanism,
         }),
         now,
         now,
@@ -1239,6 +1264,28 @@ export async function runWritingLoop(
       ),
     );
   }
+  // ---- 头号写手 v2：章节摘要（双记忆） ----
+  const chapterSummary = summarizeChapter(polished, brief.chapterTitle, sequence);
+  statements.push(
+    db
+      .prepare(`INSERT INTO chapter_summaries
+      (id, project_id, chapter_id, sequence, title, summary, key_facts_json, created_at, updated_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(chapter_id) DO UPDATE SET
+        summary = excluded.summary, key_facts_json = excluded.key_facts_json,
+        updated_at = excluded.updated_at`)
+      .bind(
+        crypto.randomUUID(),
+        projectId,
+        chapterId,
+        sequence,
+        chapterSummary.title,
+        chapterSummary.summary,
+        JSON.stringify(chapterSummary.keyFacts),
+        now,
+        now,
+      ),
+  );
   await db.batch(statements);
   await seedProjectContinuity(db, projectId, brief, now);
   await persistContinuityFeedback(db, {
@@ -1381,6 +1428,10 @@ export async function workspaceSnapshot(db: D1Database) {
     findings,
     continuityItems,
     continuityEvents,
+    ideas,
+    chapterSummaries,
+    preferences,
+    volumes,
   ] = await Promise.all([
     db.prepare('SELECT * FROM books ORDER BY created_at DESC LIMIT 20').all(),
     db
@@ -1413,6 +1464,16 @@ export async function workspaceSnapshot(db: D1Database) {
         'SELECT * FROM continuity_events ORDER BY created_at DESC LIMIT 1000',
       )
       .all(),
+    db
+      .prepare('SELECT * FROM ideas ORDER BY updated_at DESC LIMIT 100')
+      .all(),
+    db
+      .prepare(
+        'SELECT * FROM chapter_summaries ORDER BY sequence DESC LIMIT 200',
+      )
+      .all(),
+    db.prepare('SELECT * FROM user_preferences ORDER BY updated_at DESC').all(),
+    db.prepare('SELECT * FROM volumes ORDER BY volume_no ASC LIMIT 50').all(),
   ]);
   return {
     books: books.results,
@@ -1424,5 +1485,143 @@ export async function workspaceSnapshot(db: D1Database) {
     findings: findings.results,
     continuityItems: continuityItems.results,
     continuityEvents: continuityEvents.results,
+    ideas: ideas.results,
+    chapterSummaries: chapterSummaries.results,
+    preferences: preferences.results,
+    volumes: volumes.results,
   };
+}
+
+// ----------------------------------------------------------------
+// 头号写手 v2：灵感库 / 偏好记忆 / 卷规划（确定性 CRUD）
+// ----------------------------------------------------------------
+
+export type IdeaInput = {
+  kind?: string;
+  title: string;
+  content: string;
+  priority?: number;
+  personTag?: string;
+  tags?: string[];
+  placement?: string;
+};
+
+export async function saveIdea(
+  db: D1Database,
+  input: IdeaInput,
+): Promise<{ id: string }> {
+  const now = Date.now();
+  const id = crypto.randomUUID();
+  await db
+    .prepare(`INSERT INTO ideas
+      (id, kind, title, content, priority, person_tag, tags_json, placement, status, created_at, updated_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'active', ?, ?)`)
+    .bind(
+      id,
+      input.kind?.trim() || '情节点',
+      input.title.trim(),
+      input.content.trim(),
+      Math.max(1, Math.min(5, Number(input.priority) || 3)),
+      input.personTag?.trim() || null,
+      JSON.stringify(input.tags ?? []),
+      input.placement?.trim() || null,
+      now,
+      now,
+    )
+    .run();
+  return { id };
+}
+
+export async function updateIdeaStatus(
+  db: D1Database,
+  id: string,
+  status: 'active' | 'used' | 'discarded',
+  usedInSequence?: number,
+): Promise<void> {
+  await db
+    .prepare(
+      'UPDATE ideas SET status = ?, used_in_sequence = ?, updated_at = ? WHERE id = ?',
+    )
+    .bind(status, usedInSequence ?? null, Date.now(), id)
+    .run();
+}
+
+export async function saveUserPreference(
+  db: D1Database,
+  key: string,
+  value: unknown,
+): Promise<void> {
+  await db
+    .prepare(`INSERT INTO user_preferences (key, value_json, updated_at)
+      VALUES (?, ?, ?)
+      ON CONFLICT(key) DO UPDATE SET value_json = excluded.value_json, updated_at = excluded.updated_at`)
+    .bind(key, JSON.stringify(value), Date.now())
+    .run();
+}
+
+export async function getUserPreferences(
+  db: D1Database,
+): Promise<Record<string, unknown>> {
+  const rows = await db
+    .prepare('SELECT key, value_json FROM user_preferences')
+    .all<{ key: string; value_json: string }>();
+  const result: Record<string, unknown> = {};
+  for (const row of rows.results) {
+    try {
+      result[row.key] = JSON.parse(row.value_json);
+    } catch {
+      // 忽略损坏的偏好项
+    }
+  }
+  return result;
+}
+
+export async function saveVolumePlan(
+  db: D1Database,
+  projectId: string,
+  totalChapters: number,
+): Promise<{ volumeCount: number }> {
+  const plan = planVolumes(totalChapters);
+  const now = Date.now();
+  await db
+    .prepare('DELETE FROM volumes WHERE project_id = ?')
+    .bind(projectId)
+    .run();
+  for (const volume of plan.volumes) {
+    await db
+      .prepare(`INSERT INTO volumes
+        (id, project_id, volume_no, title, strategy, pacing, start_sequence, end_sequence, climax_sequence, chapter_count, created_at, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+      .bind(
+        crypto.randomUUID(),
+        projectId,
+        volume.volumeNo,
+        volume.title,
+        volume.strategy,
+        volume.pacing,
+        volume.startSequence,
+        volume.endSequence,
+        volume.climaxChapter,
+        volume.chapterCount,
+        now,
+        now,
+      )
+      .run();
+  }
+  return { volumeCount: plan.volumes.length };
+}
+
+export async function listIdeas(
+  db: D1Database,
+  status?: 'active' | 'used' | 'discarded',
+): Promise<Array<Record<string, unknown>>> {
+  const rows = status
+    ? await db
+        .prepare('SELECT * FROM ideas WHERE status = ? ORDER BY priority ASC, updated_at DESC')
+        .bind(status)
+        .all()
+    : await db
+        .prepare('SELECT * FROM ideas ORDER BY status ASC, priority ASC, updated_at DESC')
+        .all();
+  return rows.results;
 }

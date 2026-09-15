@@ -22,17 +22,31 @@ import { parseBookFile } from '@/lib/book-parser';
 import { demoBookText } from '@/lib/demo-text';
 import {
   compilePromptForBrief,
+  getUserPreferences,
+  listIdeas,
   rebuildProjectChapters,
   runAnalysis,
   runWritingLoop,
   saveBook,
   saveContinuityItem,
   saveContinuityNote,
+  saveIdea,
+  saveUserPreference,
+  saveVolumePlan,
   saveWritingBrief,
   setMemoryStatus,
   updateContinuityItem,
+  updateIdeaStatus,
   workspaceSnapshot,
+  type IdeaInput,
 } from '@/lib/workspace-repository';
+import { normalizeWritingBrief, polishDraft, reviewDraft } from '@/lib/pipeline';
+import { defaultWritingBrief } from '@/lib/pipeline';
+import {
+  planVolumes,
+  summarizeChapter,
+  WRITING_GUIDES,
+} from '@/lib/writer-v2';
 
 const DB_STORE = 'agent2026n1w';
 const DB_KEY = 'sqlite-db';
@@ -514,4 +528,152 @@ export async function apiSaveBrief(
   const result = await saveWritingBrief(db, brief);
   await persistDb();
   return result as { projectId?: string; [key: string]: unknown };
+}
+
+// ----------------------------------------------------------------
+// 头号写手 v2 API：灵感库 / 偏好记忆 / 卷规划 / 多轮编辑 / 指南库
+// ----------------------------------------------------------------
+
+export async function apiSaveIdea(input: IdeaInput): Promise<{ id: string }> {
+  const { db } = await ensureRuntime();
+  if (!input.title?.trim() || !input.content?.trim()) {
+    throw new Error('灵感标题和内容不能为空。');
+  }
+  const result = await saveIdea(db, input);
+  await persistDb();
+  return result;
+}
+
+export async function apiUpdateIdeaStatus(
+  id: string,
+  status: 'active' | 'used' | 'discarded',
+): Promise<void> {
+  const { db } = await ensureRuntime();
+  if (!id) throw new Error('灵感编号无效。');
+  await updateIdeaStatus(db, id, status);
+  await persistDb();
+}
+
+export async function apiListIdeas(): Promise<Array<Record<string, unknown>>> {
+  const { db } = await ensureRuntime();
+  return listIdeas(db);
+}
+
+export async function apiSavePreference(
+  key: string,
+  value: unknown,
+): Promise<void> {
+  const { db } = await ensureRuntime();
+  if (!key) throw new Error('偏好键名无效。');
+  await saveUserPreference(db, key, value);
+  await persistDb();
+}
+
+export async function apiGetPreferences(): Promise<Record<string, unknown>> {
+  const { db } = await ensureRuntime();
+  return getUserPreferences(db);
+}
+
+export async function apiSaveVolumePlan(
+  projectId: string,
+  totalChapters: number,
+): Promise<{ volumeCount: number }> {
+  const { db } = await ensureRuntime();
+  if (!projectId) throw new Error('请先保存作品简报。');
+  const result = await saveVolumePlan(db, projectId, totalChapters);
+  await persistDb();
+  return result;
+}
+
+export async function apiGetVolumePlan(totalChapters: number) {
+  return planVolumes(totalChapters);
+}
+
+// 多轮编辑：对指定章节的现有正文再跑一轮“润色+复审”，最多 3 轮。
+// 借鉴 chinese-novelist-skill 的“不合格自动重写最多 3 轮”与 ReNovel 的“继续改写”。
+export async function apiContinuePolish(
+  chapterId: string,
+  options?: { rounds?: number },
+): Promise<{
+  roundsRun: number;
+  beforeLength: number;
+  afterLength: number;
+  changes: string[];
+  reviewPassed: boolean;
+}> {
+  const { db } = await ensureRuntime();
+  if (!chapterId) throw new Error('章节编号无效。');
+  const row = await db
+    .prepare(
+      'SELECT c.*, p.story_bible_json AS bible FROM chapters c JOIN story_projects p ON p.id = c.project_id WHERE c.id = ?',
+    )
+    .bind(chapterId)
+    .first<Record<string, unknown>>();
+  if (!row) throw new Error('找不到该章节。');
+  let polished = String(row.content ?? '');
+  const brief = (() => {
+    try {
+      return normalizeWritingBrief(JSON.parse(String(row.bible ?? '{}')));
+    } catch {
+      return defaultWritingBrief;
+    }
+  })();
+  const rounds = Math.min(3, Math.max(1, Number(options?.rounds) || 1));
+  const changes: string[] = [];
+  let roundsRun = 0;
+  for (let index = 0; index < rounds; index += 1) {
+    const result = polishDraft(polished, brief);
+    if (result.appliedChanges.length === 0) break;
+    polished = result.polished;
+    changes.push(...result.appliedChanges);
+    roundsRun += 1;
+  }
+  const afterFindings = reviewDraft(polished, {
+    targetLength: brief.targetLength,
+    protagonistName: brief.characters[0]?.name,
+  });
+  const reviewPassed = !afterFindings.some(
+    (finding) => finding.severity === 'error',
+  );
+  if (roundsRun > 0) {
+    const now = Date.now();
+    await db
+      .prepare('UPDATE chapters SET content = ?, updated_at = ? WHERE id = ?')
+      .bind(polished, now, chapterId)
+      .run();
+    // 同步更新摘要
+    const summaryRow = await db
+      .prepare('SELECT sequence, title FROM chapter_summaries WHERE chapter_id = ?')
+      .bind(chapterId)
+      .first<{ sequence: number; title: string }>();
+    if (summaryRow) {
+      const updated = summarizeChapter(
+        polished,
+        summaryRow.title,
+        summaryRow.sequence,
+      );
+      await db
+        .prepare(
+          'UPDATE chapter_summaries SET summary = ?, key_facts_json = ?, updated_at = ? WHERE chapter_id = ?',
+        )
+        .bind(updated.summary, JSON.stringify(updated.keyFacts), now, chapterId)
+        .run();
+    }
+    await persistDb();
+  }
+  return {
+    roundsRun,
+    beforeLength: String(row.content ?? '').length,
+    afterLength: polished.length,
+    changes,
+    reviewPassed,
+  };
+}
+
+export async function apiGetGuides() {
+  return WRITING_GUIDES;
+}
+
+export async function apiGetHooks() {
+  return WRITING_GUIDES.find((guide) => guide.id === 'suspense-guide')?.content ?? [];
 }
